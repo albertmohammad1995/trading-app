@@ -88,6 +88,7 @@ public class FloatingWidgetService extends Service {
     private boolean isAiInFlight = false;
     private int lastAiMinuteKey = -1;
     private long lastCollectionTimeMs = 0;
+    private long sessionStartTimeMs = 0;
 
     // সম্মিলিত লাইভ মার্কেট ডেটা ক্যাশ
     private volatile double latestPrice = 0.0;
@@ -99,7 +100,7 @@ public class FloatingWidgetService extends Service {
 
     private String lockedSignalText = "READY";
     private int lockedSignalColor = Color.WHITE;
-    private String lockedReasonText = "48/min nonstop scan ready";
+    private String lockedReasonText = "0s - 48/min nonstop scan ready";
 
     private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService aiExecutor = Executors.newSingleThreadExecutor();
@@ -114,6 +115,7 @@ public class FloatingWidgetService extends Service {
             int sec = now.get(Calendar.SECOND);
             int minuteKey = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE);
             long nowMs = System.currentTimeMillis();
+            long elapsedSec = Math.max(0L, (nowMs - sessionStartTimeMs) / 1000L);
 
             String selectedPair = spinnerCurrency.getSelectedItem().toString();
 
@@ -127,11 +129,11 @@ public class FloatingWidgetService extends Service {
             if (sec >= SIGNAL_START_SECOND && sec <= SIGNAL_END_SECOND) {
                 if (minuteKey != lastAiMinuteKey && !isAiInFlight && !latestCandlesSummary.isEmpty()) {
                     lastAiMinuteKey = minuteKey;
-                    triggerAiDecision(selectedPair, sec);
+                    triggerAiDecision(selectedPair, sec, elapsedSec);
                 } else if (!isAiInFlight) {
                     tvSignalResult.setText(lockedSignalText);
                     tvSignalResult.setTextColor(lockedSignalColor);
-                    tvReason.setText("[" + sec + "s / 50-55s] " + lockedReasonText);
+                    tvReason.setText("[" + elapsedSec + "s | C:" + sec + "s] " + lockedReasonText);
                 }
             } else if (!isAiInFlight) {
                 String liveBias = (latestEma9 > latestEma21) ? "LIVE: BULLISH"
@@ -141,7 +143,7 @@ public class FloatingWidgetService extends Service {
 
                 tvSignalResult.setText(liveBias);
                 tvSignalResult.setTextColor(biasColor);
-                tvReason.setText("[" + sec + "s] RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " | " + lastUsedKeyLabel);
+                tvReason.setText("[" + elapsedSec + "s] RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " | " + lastUsedKeyLabel);
             }
 
             mainHandler.postDelayed(this, 200);
@@ -151,6 +153,11 @@ public class FloatingWidgetService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        return START_STICKY;
     }
 
     @Override
@@ -187,6 +194,8 @@ public class FloatingWidgetService extends Service {
         String[] pairs = {"EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "EUR/JPY", "BTC/USD", "ETH/USD"};
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, pairs);
         spinnerCurrency.setAdapter(adapter);
+
+        resetSessionState();
 
         btnClose.setOnClickListener(v -> {
             stopAutoLoop();
@@ -225,14 +234,46 @@ public class FloatingWidgetService extends Service {
         });
     }
 
-    private void startAutoLoop() {
-        isAutoRunning = true;
+    private void resetSessionState() {
+        long now = System.currentTimeMillis();
+        sessionStartTimeMs = now;
+        lastCollectionTimeMs = 0L;
         lastAiMinuteKey = -1;
-        lastCollectionTimeMs = 0;
+        isScanInFlight = false;
+        isAiInFlight = false;
+        usingBackupPool = false;
+        roundRobinIndex = 0;
+        finnhubIndex = 0;
+        lastUsedKeyLabel = "TD-Init";
+
+        latestPrice = 0.0;
+        latestFinnhubTick = "N/A";
+        latestRsi = 50.0;
+        latestEma9 = 0.0;
+        latestEma21 = 0.0;
+        latestCandlesSummary = "";
+
+        lockedSignalText = "READY";
+        lockedSignalColor = Color.WHITE;
+        lockedReasonText = "0s - Fresh scan started";
+
+        if (tvSignalResult != null) {
+            tvSignalResult.setText(lockedSignalText);
+            tvSignalResult.setTextColor(lockedSignalColor);
+        }
+        if (tvReason != null) {
+            tvReason.setText(lockedReasonText);
+        }
+    }
+
+    private void startAutoLoop() {
+        resetSessionState();
+        isAutoRunning = true;
         btnAnalyze.setText("STOP 48/m ENGINE");
         btnAnalyze.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.parseColor("#EF4444")));
         tvSignalResult.setText("NONSTOP 48/m");
         tvSignalResult.setTextColor(Color.CYAN);
+        tvReason.setText("[0s] Starting fresh scan...");
         mainHandler.removeCallbacks(nonstopEngineRunnable);
         mainHandler.post(nonstopEngineRunnable);
     }
@@ -240,9 +281,10 @@ public class FloatingWidgetService extends Service {
     private void stopAutoLoop() {
         isAutoRunning = false;
         mainHandler.removeCallbacks(nonstopEngineRunnable);
+        resetSessionState();
         btnAnalyze.setText("START 48/m AUTO");
         btnAnalyze.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.parseColor("#10B981")));
-        tvReason.setText("Stopped by user");
+        tvReason.setText("Stopped & reset to 0s");
     }
 
     private void collectLiveDataNonstop(String symbol) {
@@ -288,12 +330,12 @@ public class FloatingWidgetService extends Service {
         });
     }
 
-    private void triggerAiDecision(String symbol, int triggerSec) {
+    private void triggerAiDecision(String symbol, int triggerSec, long elapsedSec) {
         isAiInFlight = true;
         mainHandler.post(() -> {
             tvSignalResult.setText("ANALYZING...");
             tvSignalResult.setTextColor(Color.YELLOW);
-            tvReason.setText("[" + triggerSec + "s] Combining TD + FH + AI...");
+            tvReason.setText("[" + elapsedSec + "s | C:" + triggerSec + "s] Combining TD + FH + AI...");
         });
 
         aiExecutor.execute(() -> {
@@ -363,10 +405,11 @@ public class FloatingWidgetService extends Service {
         mainHandler.post(() -> {
             isAiInFlight = false;
             if (!isAutoRunning) return;
+            long eSec = Math.max(0L, (System.currentTimeMillis() - sessionStartTimeMs) / 1000L);
             int s = Calendar.getInstance().get(Calendar.SECOND);
             tvSignalResult.setText(lockedSignalText);
             tvSignalResult.setTextColor(lockedSignalColor);
-            tvReason.setText("[" + s + "s / 50-55s] " + lockedReasonText);
+            tvReason.setText("[" + eSec + "s | C:" + s + "s] " + lockedReasonText);
         });
     }
 
@@ -561,6 +604,12 @@ public class FloatingWidgetService extends Service {
     public void onDestroy() {
         super.onDestroy();
         stopAutoLoop();
-        if (floatingView != null) windowManager.removeView(floatingView);
+        if (floatingView != null) {
+            try {
+                windowManager.removeView(floatingView);
+            } catch (Exception ignored) {
+            }
+            floatingView = null;
+        }
     }
 }
