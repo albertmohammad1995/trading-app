@@ -534,15 +534,9 @@ public class FloatingWidgetService extends Service {
     }
 
     private String callGeminiAPI(String promptText) throws Exception {
-        String endpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
-                + GEMINI_MODEL + ":generateContent?key=" + GEMINI_API_KEY.trim();
-        URL url = new URL(endpoint);
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("POST");
-        conn.setRequestProperty("Content-Type", "application/json");
-        conn.setConnectTimeout(7000);
-        conn.setReadTimeout(7000);
-        conn.setDoOutput(true);
+        String key = GEMINI_API_KEY.trim();
+        String baseEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
+                + GEMINI_MODEL + ":generateContent";
 
         JSONObject textPart = new JSONObject().put("text", promptText);
         JSONObject parts = new JSONObject().put("parts", new JSONArray().put(textPart));
@@ -551,8 +545,33 @@ public class FloatingWidgetService extends Service {
                 .put("contents", new JSONArray().put(parts))
                 .put("generationConfig", genConfig);
 
+        // ১. Bearer হেডার দিয়ে চেষ্টা
+        try {
+            return postGeminiRequest(baseEndpoint, payload.toString(), "Bearer " + key);
+        } catch (Exception bearerEx) {
+            String msg = bearerEx.getMessage() != null ? bearerEx.getMessage() : "";
+            if (!msg.contains("401") && !msg.contains("403")) {
+                throw bearerEx;
+            }
+            // ২. Bearer না কাজ করলে query ?key= দিয়ে ফলব্যাক চেষ্টা
+            return postGeminiRequest(baseEndpoint + "?key=" + key, payload.toString(), null);
+        }
+    }
+
+    private String postGeminiRequest(String endpointUrl, String jsonBody, String authHeader) throws Exception {
+        URL url = new URL(endpointUrl);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/json");
+        if (authHeader != null && !authHeader.isEmpty()) {
+            conn.setRequestProperty("Authorization", authHeader);
+        }
+        conn.setConnectTimeout(7000);
+        conn.setReadTimeout(7000);
+        conn.setDoOutput(true);
+
         try (OutputStream os = conn.getOutputStream()) {
-            os.write(payload.toString().getBytes("UTF-8"));
+            os.write(jsonBody.getBytes("UTF-8"));
         }
 
         int code = conn.getResponseCode();
