@@ -26,6 +26,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
@@ -60,19 +61,20 @@ public class FloatingWidgetService extends Service {
             "4a4da53be96741359cbb1262b0cd0bf0"
     };
 
-    // Finnhub ২টি Key (পালাক্রমে লাইভ টিক প্রাইস আনবে)
+    // Finnhub Key পুল (পালাক্রমে লাইভ টিক প্রাইস আনবে)
     private static final String[] FINNHUB_KEYS = {
             "dc199qhr01qgfid6qm8gdc199qhr01qgfid6qm90",
-            "Dc19bdhr01qgfid6qqi0dc19bdhr01qgfid6qqig"
+            "dc19bdhr01qgfid6qqi0dc19bdhr01qgfid6qqig"
     };
 
     private int roundRobinIndex = 0;
     private int finnhubIndex = 0;
     private boolean usingBackupPool = false;
-    private String lastUsedKeyLabel = "";
+    private String lastUsedKeyLabel = "TD-Init";
 
     // Gemini API Key
     private static final String GEMINI_API_KEY = "AQ.Ab8RN6LeSxQQuI2grPNiubo5H-lS2mRvGpmVv26BtGSE5XngUQ";
+    private static final String GEMINI_MODEL = "gemini-2.5-flash";
 
     // প্রতি মিনিটের ৫০ থেকে ৫৫ সেকেন্ড পর্যন্ত UP / DOWN / WAIT নির্দেশনা দেবে
     private static final int SIGNAL_START_SECOND = 50;
@@ -121,7 +123,7 @@ public class FloatingWidgetService extends Service {
                 collectLiveDataNonstop(selectedPair);
             }
 
-            // ২. ৫০ থেকে ৫৫ সেকেন্ডের উইন্ডোতে AI নির্দেশনা (UP / DOWN / WAIT)
+            // ২. ৫০ থেকে ৫৫ সেকেন্ডের উইন্ডোতে সিগন্যাল নির্দেশনা (UP / DOWN / WAIT)
             if (sec >= SIGNAL_START_SECOND && sec <= SIGNAL_END_SECOND) {
                 if (minuteKey != lastAiMinuteKey && !isAiInFlight && !latestCandlesSummary.isEmpty()) {
                     lastAiMinuteKey = minuteKey;
@@ -250,7 +252,11 @@ public class FloatingWidgetService extends Service {
                 JSONObject json = fetchMarketDataSmartPool(symbol);
                 String fhTick = fetchFinnhubLivePriceRotated(symbol);
 
-                JSONArray values = json.getJSONArray("values");
+                JSONArray values = json.optJSONArray("values");
+                if (values == null || values.length() == 0) {
+                    throw new Exception("Empty candles");
+                }
+
                 List<Double> closes = new ArrayList<>();
                 StringBuilder recentCandles = new StringBuilder();
 
@@ -291,57 +297,76 @@ public class FloatingWidgetService extends Service {
         });
 
         aiExecutor.execute(() -> {
+            String effectivePriceRef = !"N/A".equals(latestFinnhubTick)
+                    ? latestFinnhubTick
+                    : String.valueOf(latestPrice);
+
             try {
-                String prompt = "You are an expert 1-minute binary & forex scalping analyst. We are in the 50s-55s decision window before the next 1-minute candle opens. Combine and analyze this live data from Twelve Data, Finnhub, and indicators for " + symbol + ":\n" +
-                        "Twelve Data Candle Close: " + latestPrice + " | Live Finnhub Tick: " + latestFinnhubTick + "\n" +
+                String prompt = "You are an expert 1-minute binary & forex scalping analyst. We are in the 50s-55s decision window before the next 1-minute candle opens. Analyze this live data for " + symbol + ":\n" +
+                        "Twelve Data Close: " + latestPrice + " | Finnhub Tick: " + latestFinnhubTick + " (Ref Price: " + effectivePriceRef + ")\n" +
                         "RSI(14): " + String.format("%.2f", latestRsi) + "\n" +
                         "EMA(9): " + String.format("%.5f", latestEma9) + " | EMA(21): " + String.format("%.5f", latestEma21) + "\n" +
                         "Last 8 Candles (oldest to newest): " + latestCandlesSummary + "\n\n" +
                         "Rules:\n" +
-                        "- If strong bullish setup for next candle, reply UP.\n" +
-                        "- If strong bearish setup for next candle, reply DOWN.\n" +
-                        "- If choppy/flat/risky, reply WAIT.\n" +
-                        "Respond strictly in JSON format only: {\"signal\": \"UP\" or \"DOWN\" or \"WAIT\", \"confidence\": \"85%\", \"reason\": \"max 6 words reason\"}";
+                        "- Strong bullish setup -> UP\n" +
+                        "- Strong bearish setup -> DOWN\n" +
+                        "- Choppy/flat/unclear -> WAIT\n" +
+                        "Reply strictly in JSON: {\"signal\": \"UP\" or \"DOWN\" or \"WAIT\", \"confidence\": \"80%\", \"reason\": \"max 6 words\"}";
 
                 String aiResultJson = callGeminiAPI(prompt);
-                JSONObject aiObj = new JSONObject(aiResultJson);
+                JSONObject aiObj = extractJsonObject(aiResultJson);
 
-                String signal = aiObj.optString("signal", "WAIT").toUpperCase();
-                String confidence = aiObj.optString("confidence", "");
-                String reason = aiObj.optString("reason", "Signal ready");
-
-                lockedSignalText = signal + (confidence.isEmpty() ? "" : " (" + confidence + ")");
-                lockedReasonText = reason + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " [" + lastUsedKeyLabel + "]";
-
-                if (signal.contains("UP")) {
-                    lockedSignalColor = Color.parseColor("#10B981");
-                } else if (signal.contains("DOWN")) {
-                    lockedSignalColor = Color.parseColor("#EF4444");
-                } else {
-                    lockedSignalColor = Color.parseColor("#F59E0B");
+                String signal = aiObj.optString("signal", "WAIT").toUpperCase().trim();
+                if (!signal.equals("UP") && !signal.equals("DOWN") && !signal.equals("WAIT")) {
+                    signal = computeTechnicalFallbackSignal();
                 }
 
-                mainHandler.post(() -> {
-                    isAiInFlight = false;
-                    if (!isAutoRunning) return;
-                    int s = Calendar.getInstance().get(Calendar.SECOND);
-                    tvSignalResult.setText(lockedSignalText);
-                    tvSignalResult.setTextColor(lockedSignalColor);
-                    tvReason.setText("[" + s + "s / 50-55s] " + lockedReasonText);
-                });
+                String confidence = aiObj.optString("confidence", "");
+                String reason = aiObj.optString("reason", "AI analysis");
+
+                applyLockedSignal(signal, confidence, reason + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " [" + lastUsedKeyLabel + "]");
 
             } catch (Exception e) {
-                mainHandler.post(() -> {
-                    isAiInFlight = false;
-                    if (!isAutoRunning) return;
-                    lockedSignalText = "WAIT";
-                    lockedSignalColor = Color.parseColor("#F59E0B");
-                    lockedReasonText = e.getMessage();
-                    tvSignalResult.setText(lockedSignalText);
-                    tvSignalResult.setTextColor(lockedSignalColor);
-                    tvReason.setText(lockedReasonText);
-                });
+                String fallbackSignal = computeTechnicalFallbackSignal();
+                String shortErr = e.getMessage() != null ? e.getMessage() : "AI err";
+                if (shortErr.length() > 28) shortErr = shortErr.substring(0, 28);
+                applyLockedSignal(
+                        fallbackSignal,
+                        "TECH",
+                        "AI:" + shortErr + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick
+                );
             }
+        });
+    }
+
+    private String computeTechnicalFallbackSignal() {
+        if (latestEma9 > latestEma21 && latestRsi >= 52 && latestRsi <= 78) {
+            return "UP";
+        } else if (latestEma9 < latestEma21 && latestRsi <= 48 && latestRsi >= 22) {
+            return "DOWN";
+        }
+        return "WAIT";
+    }
+
+    private void applyLockedSignal(String signal, String confidence, String reasonDetail) {
+        lockedSignalText = signal + (confidence.isEmpty() ? "" : " (" + confidence + ")");
+        lockedReasonText = reasonDetail;
+
+        if ("UP".equals(signal)) {
+            lockedSignalColor = Color.parseColor("#10B981");
+        } else if ("DOWN".equals(signal)) {
+            lockedSignalColor = Color.parseColor("#EF4444");
+        } else {
+            lockedSignalColor = Color.parseColor("#F59E0B");
+        }
+
+        mainHandler.post(() -> {
+            isAiInFlight = false;
+            if (!isAutoRunning) return;
+            int s = Calendar.getInstance().get(Calendar.SECOND);
+            tvSignalResult.setText(lockedSignalText);
+            tvSignalResult.setTextColor(lockedSignalColor);
+            tvReason.setText("[" + s + "s / 50-55s] " + lockedReasonText);
         });
     }
 
@@ -358,7 +383,7 @@ public class FloatingWidgetService extends Service {
         }
 
         usingBackupPool = false;
-        throw new Exception("All 8 Twelve Data keys reached limit!");
+        throw new Exception("All Twelve Data keys busy");
     }
 
     private JSONObject tryPool(String[] pool, String symbol, String poolName) throws Exception {
@@ -368,13 +393,13 @@ public class FloatingWidgetService extends Service {
             roundRobinIndex = (roundRobinIndex + 1) % pool.length;
 
             String key = pool[idx];
-            if (key == null || key.isEmpty()) {
+            if (key == null || key.trim().isEmpty()) {
                 attempts++;
                 continue;
             }
 
             String apiUrl = "https://api.twelvedata.com/time_series?symbol=" + symbol +
-                    "&interval=1min&outputsize=30&apikey=" + key;
+                    "&interval=1min&outputsize=30&apikey=" + key.trim();
 
             String response = httpGet(apiUrl);
             JSONObject json = new JSONObject(response);
@@ -394,17 +419,27 @@ public class FloatingWidgetService extends Service {
             int idx = finnhubIndex % FINNHUB_KEYS.length;
             finnhubIndex = (finnhubIndex + 1) % FINNHUB_KEYS.length;
             String key = FINNHUB_KEYS[idx];
-            if (key == null || key.isEmpty()) continue;
+            if (key == null || key.trim().isEmpty()) continue;
 
-            try {
-                String fhSymbol = pair.contains("BTC") || pair.contains("ETH")
-                        ? "BINANCE:" + pair.replace("/", "") + (pair.endsWith("/USD") ? "T" : "")
-                        : "OANDA:" + pair.replace("/", "_");
-                String url = "https://finnhub.io/api/v1/quote?symbol=" + fhSymbol + "&token=" + key;
-                JSONObject obj = new JSONObject(httpGet(url));
-                double c = obj.optDouble("c", 0.0);
-                if (c > 0) return String.valueOf(c);
-            } catch (Exception ignored) {
+            String[] candidates;
+            if (pair.contains("BTC") || pair.contains("ETH")) {
+                String base = pair.replace("/", "");
+                candidates = new String[]{"BINANCE:" + base + "T", "BINANCE:" + base};
+            } else {
+                String underscored = pair.replace("/", "_");
+                candidates = new String[]{"OANDA:" + underscored, "FOREX:" + pair};
+            }
+
+            for (String fhSymbol : candidates) {
+                try {
+                    String url = "https://finnhub.io/api/v1/quote?symbol=" + fhSymbol + "&token=" + key.trim();
+                    JSONObject obj = new JSONObject(httpGet(url));
+                    double c = obj.optDouble("c", 0.0);
+                    if (c > 0) {
+                        return String.valueOf(c);
+                    }
+                } catch (Exception ignored) {
+                }
             }
         }
         return "N/A";
@@ -424,6 +459,7 @@ public class FloatingWidgetService extends Service {
     }
 
     private double calculateEMA(List<Double> closes, int period) {
+        if (closes.isEmpty()) return 0.0;
         double multiplier = 2.0 / (period + 1);
         double ema = closes.get(0);
         for (int i = 1; i < closes.size(); i++) {
@@ -436,45 +472,75 @@ public class FloatingWidgetService extends Service {
         URL url = new URL(urlString);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestMethod("GET");
-        BufferedReader in = new BufferedReader(new InputStreamReader(
-                conn.getResponseCode() >= 400 ? conn.getErrorStream() : conn.getInputStream()));
+        conn.setConnectTimeout(6000);
+        conn.setReadTimeout(6000);
+
+        int code = conn.getResponseCode();
+        InputStream stream = (code >= 400) ? conn.getErrorStream() : conn.getInputStream();
+        if (stream == null) return "{}";
+
+        BufferedReader in = new BufferedReader(new InputStreamReader(stream));
         StringBuilder content = new StringBuilder();
         String line;
         while ((line = in.readLine()) != null) content.append(line);
         in.close();
+        conn.disconnect();
         return content.toString();
     }
 
     private String callGeminiAPI(String promptText) throws Exception {
-        URL url = new URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + GEMINI_API_KEY);
+        String endpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
+                + GEMINI_MODEL + ":generateContent?key=" + GEMINI_API_KEY.trim();
+        URL url = new URL(endpoint);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestMethod("POST");
         conn.setRequestProperty("Content-Type", "application/json");
+        conn.setConnectTimeout(7000);
+        conn.setReadTimeout(7000);
         conn.setDoOutput(true);
 
         JSONObject textPart = new JSONObject().put("text", promptText);
         JSONObject parts = new JSONObject().put("parts", new JSONArray().put(textPart));
-        JSONObject payload = new JSONObject().put("contents", new JSONArray().put(parts));
+        JSONObject genConfig = new JSONObject().put("responseMimeType", "application/json");
+        JSONObject payload = new JSONObject()
+                .put("contents", new JSONArray().put(parts))
+                .put("generationConfig", genConfig);
 
         try (OutputStream os = conn.getOutputStream()) {
             os.write(payload.toString().getBytes("UTF-8"));
         }
 
-        BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+        int code = conn.getResponseCode();
+        InputStream stream = (code >= 400) ? conn.getErrorStream() : conn.getInputStream();
+        BufferedReader in = new BufferedReader(new InputStreamReader(stream));
         StringBuilder response = new StringBuilder();
         String line;
         while ((line = in.readLine()) != null) response.append(line);
         in.close();
+        conn.disconnect();
+
+        if (code >= 400) {
+            throw new Exception("HTTP " + code);
+        }
 
         JSONObject jsonResponse = new JSONObject(response.toString());
-        String rawText = jsonResponse.getJSONArray("candidates")
+        return jsonResponse.getJSONArray("candidates")
                 .getJSONObject(0)
                 .getJSONObject("content")
                 .getJSONArray("parts")
                 .getJSONObject(0)
                 .getString("text");
+    }
 
-        return rawText.replace("```json", "").replace("```", "").trim();
+    private JSONObject extractJsonObject(String raw) throws Exception {
+        if (raw == null) throw new Exception("Empty AI text");
+        String cleaned = raw.replace("```json", "").replace("```", "").trim();
+        int start = cleaned.indexOf('{');
+        int end = cleaned.lastIndexOf('}');
+        if (start >= 0 && end > start) {
+            cleaned = cleaned.substring(start, end + 1);
+        }
+        return new JSONObject(cleaned);
     }
 
     private void startForegroundNotification() {
