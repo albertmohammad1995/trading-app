@@ -32,7 +32,6 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
-import java.util.Calendar;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -76,7 +75,7 @@ public class FloatingWidgetService extends Service {
     private static final String GEMINI_API_KEY = "AQ.Ab8RN6LeSxQQuI2grPNiubo5H-lS2mRvGpmVv26BtGSE5XngUQ";
     private static final String GEMINI_MODEL = "gemini-2.5-flash";
 
-    // প্রতি মিনিটের ৫০ থেকে ৫৫ সেকেন্ড পর্যন্ত UP / DOWN / WAIT নির্দেশনা দেবে
+    // প্রতি ৬০ সেকেন্ডের সাইকেলে ৫০ থেকে ৫৫ সেকেন্ড পর্যন্ত UP / DOWN / WAIT নির্দেশনা দেবে
     private static final int SIGNAL_START_SECOND = 50;
     private static final int SIGNAL_END_SECOND = 55;
 
@@ -86,9 +85,9 @@ public class FloatingWidgetService extends Service {
     private boolean isAutoRunning = false;
     private boolean isScanInFlight = false;
     private boolean isAiInFlight = false;
-    private int lastAiMinuteKey = -1;
-    private long lastCollectionTimeMs = 0;
-    private long sessionStartTimeMs = 0;
+    private long lastAiCycleNumber = -1L;
+    private long lastCollectionTimeMs = 0L;
+    private long sessionStartTimeMs = 0L;
 
     // সম্মিলিত লাইভ মার্কেট ডেটা ক্যাশ
     private volatile double latestPrice = 0.0;
@@ -111,11 +110,10 @@ public class FloatingWidgetService extends Service {
         public void run() {
             if (!isAutoRunning) return;
 
-            Calendar now = Calendar.getInstance();
-            int sec = now.get(Calendar.SECOND);
-            int minuteKey = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE);
             long nowMs = System.currentTimeMillis();
             long elapsedSec = Math.max(0L, (nowMs - sessionStartTimeMs) / 1000L);
+            long cycleNumber = elapsedSec / 60L;
+            int cycleSec = (int) (elapsedSec % 60L);
 
             String selectedPair = spinnerCurrency.getSelectedItem().toString();
 
@@ -125,15 +123,15 @@ public class FloatingWidgetService extends Service {
                 collectLiveDataNonstop(selectedPair);
             }
 
-            // ২. ৫০ থেকে ৫৫ সেকেন্ডের উইন্ডোতে সিগন্যাল নির্দেশনা (UP / DOWN / WAIT)
-            if (sec >= SIGNAL_START_SECOND && sec <= SIGNAL_END_SECOND) {
-                if (minuteKey != lastAiMinuteKey && !isAiInFlight && !latestCandlesSummary.isEmpty()) {
-                    lastAiMinuteKey = minuteKey;
-                    triggerAiDecision(selectedPair, sec, elapsedSec);
+            // ২. শুধুমাত্র ৫০ থেকে ৫৫ সেকেন্ডের উইন্ডোতে সিগন্যাল নির্দেশনা (UP / DOWN / WAIT)
+            if (cycleSec >= SIGNAL_START_SECOND && cycleSec <= SIGNAL_END_SECOND) {
+                if (cycleNumber != lastAiCycleNumber && !isAiInFlight && !latestCandlesSummary.isEmpty()) {
+                    lastAiCycleNumber = cycleNumber;
+                    triggerAiDecision(selectedPair, cycleSec, cycleNumber);
                 } else if (!isAiInFlight) {
                     tvSignalResult.setText(lockedSignalText);
                     tvSignalResult.setTextColor(lockedSignalColor);
-                    tvReason.setText("[" + elapsedSec + "s | C:" + sec + "s] " + lockedReasonText);
+                    tvReason.setText("[" + cycleSec + "s / 50-55s] " + lockedReasonText);
                 }
             } else if (!isAiInFlight) {
                 String liveBias = (latestEma9 > latestEma21) ? "LIVE: BULLISH"
@@ -143,7 +141,7 @@ public class FloatingWidgetService extends Service {
 
                 tvSignalResult.setText(liveBias);
                 tvSignalResult.setTextColor(biasColor);
-                tvReason.setText("[" + elapsedSec + "s] RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " | " + lastUsedKeyLabel);
+                tvReason.setText("[" + cycleSec + "s] RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " | " + lastUsedKeyLabel);
             }
 
             mainHandler.postDelayed(this, 200);
@@ -238,7 +236,7 @@ public class FloatingWidgetService extends Service {
         long now = System.currentTimeMillis();
         sessionStartTimeMs = now;
         lastCollectionTimeMs = 0L;
-        lastAiMinuteKey = -1;
+        lastAiCycleNumber = -1L;
         isScanInFlight = false;
         isAiInFlight = false;
         usingBackupPool = false;
@@ -330,12 +328,12 @@ public class FloatingWidgetService extends Service {
         });
     }
 
-    private void triggerAiDecision(String symbol, int triggerSec, long elapsedSec) {
+    private void triggerAiDecision(String symbol, int triggerCycleSec, long cycleNumber) {
         isAiInFlight = true;
         mainHandler.post(() -> {
             tvSignalResult.setText("ANALYZING...");
             tvSignalResult.setTextColor(Color.YELLOW);
-            tvReason.setText("[" + elapsedSec + "s | C:" + triggerSec + "s] Combining TD + FH + AI...");
+            tvReason.setText("[" + triggerCycleSec + "s / 50-55s] Combining TD + FH + AI...");
         });
 
         aiExecutor.execute(() -> {
@@ -366,7 +364,7 @@ public class FloatingWidgetService extends Service {
                 String confidence = aiObj.optString("confidence", "");
                 String reason = aiObj.optString("reason", "AI analysis");
 
-                applyLockedSignal(signal, confidence, reason + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " [" + lastUsedKeyLabel + "]");
+                applyLockedSignal(signal, confidence, reason + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " [" + lastUsedKeyLabel + "]", cycleNumber);
 
             } catch (Exception e) {
                 String fallbackSignal = computeTechnicalFallbackSignal();
@@ -375,7 +373,8 @@ public class FloatingWidgetService extends Service {
                 applyLockedSignal(
                         fallbackSignal,
                         "TECH",
-                        "AI:" + shortErr + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick
+                        "AI:" + shortErr + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick,
+                        cycleNumber
                 );
             }
         });
@@ -390,7 +389,7 @@ public class FloatingWidgetService extends Service {
         return "WAIT";
     }
 
-    private void applyLockedSignal(String signal, String confidence, String reasonDetail) {
+    private void applyLockedSignal(String signal, String confidence, String reasonDetail, long targetCycleNumber) {
         lockedSignalText = signal + (confidence.isEmpty() ? "" : " (" + confidence + ")");
         lockedReasonText = reasonDetail;
 
@@ -406,10 +405,13 @@ public class FloatingWidgetService extends Service {
             isAiInFlight = false;
             if (!isAutoRunning) return;
             long eSec = Math.max(0L, (System.currentTimeMillis() - sessionStartTimeMs) / 1000L);
-            int s = Calendar.getInstance().get(Calendar.SECOND);
-            tvSignalResult.setText(lockedSignalText);
-            tvSignalResult.setTextColor(lockedSignalColor);
-            tvReason.setText("[" + eSec + "s | C:" + s + "s] " + lockedReasonText);
+            long currentCycle = eSec / 60L;
+            int cSec = (int) (eSec % 60L);
+            if (currentCycle == targetCycleNumber && cSec >= SIGNAL_START_SECOND && cSec <= SIGNAL_END_SECOND) {
+                tvSignalResult.setText(lockedSignalText);
+                tvSignalResult.setTextColor(lockedSignalColor);
+                tvReason.setText("[" + cSec + "s / 50-55s] " + lockedReasonText);
+            }
         });
     }
 
