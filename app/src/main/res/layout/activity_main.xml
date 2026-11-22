@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0F172A"
+    android:gravity="center"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="AH AI TRADER ASSISTANT"
+        android:textColor="#38BDF8"
+        android:textSize="22sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:layout_marginBottom="24dp"
+        android:gravity="center"
+        android:text="Twelve Data (4+4) + Finnhub (2) + Gemini AI\n50s–55s UP / DOWN / WAIT Signal Engine"
+        android:textColor="#94A3B8"
+        android:textSize="14sp" />
+
+    <Button
+        android:id="@+id/btnStartOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="54dp"
+        android:backgroundTint="#10B981"
+        android:text="LAUNCH FLOATING WIDGET"
+        android:textColor="#FFFFFF"
+        android:textStyle="bold" />
+
+</LinearLayout>
