@@ -38,6 +38,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 public class FloatingWidgetService extends Service {
 
@@ -75,6 +77,15 @@ public class FloatingWidgetService extends Service {
     private boolean usingBackupPool = false;
     private String lastUsedKeyLabel = "TD-Init";
 
+    // Groq API সেটআপ
+    private static final String GROQ_API_KEY = "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";
+    private static final String GROQ_MODEL = "llama-3.3-70b-versatile";
+
+    // Cloudflare Workers AI সেটআপ
+    private static final String CF_ACCOUNT_ID = "6840586dc663a170acb2fdbbb00d6168";
+    private static final String CF_API_TOKEN = "cfut_oY0U9aGLDaXZmG3oxukQRgpslgqIHT5c7Xkq0hXt423d94d9";
+    private static final String CF_MODEL = "@cf/moonshotai/kimi-k2.7-code";
+
     // Gemini API Keys (AIzaSy Standard Key + AQ Auth Key)
     private static final String GEMINI_STANDARD_KEY = "AIzaSyB4Ru9WugjRfL6Wir0Yo0_cIVfdeuIj_70";
     private static final String GEMINI_AUTH_KEY = "AQ.Ab8RN6L6tVivJPnCVgj6sgW9QWgfbPau98h5SbpLmBDQUST_mA";
@@ -84,9 +95,10 @@ public class FloatingWidgetService extends Service {
     private static final int SIGNAL_START_SECOND_1M = 50;
     private static final int SIGNAL_END_SECOND_1M = 55;
 
-    // 15M মোড: প্রতি ৯০০ সেকেন্ড (১৫ মিনিট) সাইকেলে ১৪তম মিনিটে (14m 0s - 14m 55s) সিগন্যাল
+    // 15M মোড: প্রতি ৯০০ সেকেন্ড (১৫ মিনিট) সাইকেলে ১৪ মিনিট ৪০ থেকে ৫০ সেকেন্ড (14m 40s - 14m 50s) সিগন্যাল
     private static final int SIGNAL_MINUTE_15M = 14;
-    private static final int SIGNAL_END_SECOND_IN_14M = 55;
+    private static final int SIGNAL_START_SECOND_IN_14M = 40;
+    private static final int SIGNAL_END_SECOND_IN_14M = 50;
 
     // প্রতি ১.২৫ সেকেন্ড (১২৫০ms) পরপর ননস্টপ ডেটা কালেকশন (মিনিটে ৪৮ বার)
     private static final long COLLECTION_INTERVAL_MS = 1250;
@@ -112,8 +124,28 @@ public class FloatingWidgetService extends Service {
     private String lockedReasonText = "0s - 48/min nonstop scan ready";
 
     private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
-    private final ExecutorService aiExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService aiExecutor = Executors.newFixedThreadPool(3);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private static class AiVoteResult {
+        final String provider;
+        final String signal;
+        final String confidence;
+        final String reason;
+
+        AiVoteResult(String provider, String signal, String confidence, String reason) {
+            this.provider = provider;
+            this.signal = signal;
+            this.confidence = confidence;
+            this.reason = reason;
+        }
+    }
+
+    private boolean isIn15mSignalWindow(int minPart, int secPart) {
+        return minPart == SIGNAL_MINUTE_15M
+                && secPart >= SIGNAL_START_SECOND_IN_14M
+                && secPart <= SIGNAL_END_SECOND_IN_14M;
+    }
 
     private final Runnable nonstopEngineRunnable = new Runnable() {
         @Override
@@ -148,22 +180,20 @@ public class FloatingWidgetService extends Service {
                     updateLiveBiasUi("1M " + cycleSec + "s");
                 }
             } else {
-                // === ১৫ মিনিট (০–১৫ মিনিট) মোড: ১৪তম মিনিটে সিগন্যাল ===
+                // === ১৫ মিনিট (০–১৫ মিনিট) মোড: ১৪ মিনিট ৪০ থেকে ৫০ সেকেন্ডে সিগন্যাল ===
                 long cycleNumber = elapsedSec / 900L;
                 long secIn15m = elapsedSec % 900L;
                 int minPart = (int) (secIn15m / 60L);
                 int secPart = (int) (secIn15m % 60L);
 
-                boolean in14thMinWindow = (minPart == SIGNAL_MINUTE_15M && secPart <= SIGNAL_END_SECOND_IN_14M);
-
-                if (in14thMinWindow) {
+                if (isIn15mSignalWindow(minPart, secPart)) {
                     if (cycleNumber != lastAiCycleNumber && !isAiInFlight && !latestCandlesSummary.isEmpty()) {
                         lastAiCycleNumber = cycleNumber;
-                        triggerAiDecision(selectedPair, minPart + "m" + secPart + "s / 14m", cycleNumber, true);
+                        triggerAiDecision(selectedPair, minPart + "m" + secPart + "s / 14m40-50s", cycleNumber, true);
                     } else if (!isAiInFlight) {
                         tvSignalResult.setText(lockedSignalText);
                         tvSignalResult.setTextColor(lockedSignalColor);
-                        tvReason.setText("[15M " + minPart + "m" + secPart + "s / 14m] " + lockedReasonText);
+                        tvReason.setText("[15M " + minPart + "m" + secPart + "s / 14m40-50s] " + lockedReasonText);
                     }
                 } else if (!isAiInFlight) {
                     updateLiveBiasUi("15M " + minPart + "m" + secPart + "s");
@@ -292,7 +322,7 @@ public class FloatingWidgetService extends Service {
             }
         }
 
-        String[] modes = {"1M (0-60s -> 50-55s)", "15M (0-15m -> 14m)"};
+        String[] modes = {"1M (0-60s -> 50-55s)", "15M (0-15m -> 14m40-50s)"};
         ArrayAdapter<String> tfAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, modes);
         spinnerTimeframe.setAdapter(tfAdapter);
 
@@ -338,7 +368,7 @@ public class FloatingWidgetService extends Service {
         lockedSignalText = "READY";
         lockedSignalColor = Color.WHITE;
         lockedReasonText = is15MinuteMode
-                ? "0s - 15M mode ready (signal at 14m)"
+                ? "0s - 15M mode ready (signal at 14m40-50s)"
                 : "0s - 1M mode ready (signal at 50-55s)";
 
         if (tvSignalResult != null) {
@@ -358,7 +388,7 @@ public class FloatingWidgetService extends Service {
         tvSignalResult.setText(is15MinuteMode ? "15M ENGINE" : "1M ENGINE");
         tvSignalResult.setTextColor(Color.CYAN);
         tvReason.setText(is15MinuteMode
-                ? "[15M 0m0s] Scanning for 14m signal..."
+                ? "[15M 0m0s] Scanning for 14m40-50s signal..."
                 : "[1M 0s] Scanning for 50-55s signal...");
         mainHandler.removeCallbacks(nonstopEngineRunnable);
         mainHandler.post(nonstopEngineRunnable);
@@ -424,7 +454,7 @@ public class FloatingWidgetService extends Service {
         mainHandler.post(() -> {
             tvSignalResult.setText("ANALYZING...");
             tvSignalResult.setTextColor(Color.YELLOW);
-            tvReason.setText("[" + windowLabel + "] Combining TD + FH + AI...");
+            tvReason.setText("[" + windowLabel + "] Groq + CF + Gemini voting...");
         });
 
         aiExecutor.execute(() -> {
@@ -433,47 +463,122 @@ public class FloatingWidgetService extends Service {
                     : String.valueOf(latestPrice);
 
             String horizonText = fifteenMinMode
-                    ? "We are in the 14th minute before the next 15-minute candle opens."
+                    ? "We are at 14m40s-14m50s in the 14th minute before the next 15-minute candle opens."
                     : "We are in the 50s-55s decision window before the next 1-minute candle opens.";
 
-            try {
-                String prompt = "You are an expert binary & forex scalping analyst. " + horizonText + " Analyze this live data for " + symbol + ":\n" +
-                        "Twelve Data Close: " + latestPrice + " | Finnhub Tick: " + latestFinnhubTick + " (Ref Price: " + effectivePriceRef + ")\n" +
-                        "RSI(14): " + String.format("%.2f", latestRsi) + "\n" +
-                        "EMA(9): " + String.format("%.5f", latestEma9) + " | EMA(21): " + String.format("%.5f", latestEma21) + "\n" +
-                        "Last 8 Candles (oldest to newest): " + latestCandlesSummary + "\n\n" +
-                        "Rules:\n" +
-                        "- Strong bullish setup -> UP\n" +
-                        "- Strong bearish setup -> DOWN\n" +
-                        "- Choppy/flat/unclear -> WAIT\n" +
-                        "Reply strictly in JSON: {\"signal\": \"UP\" or \"DOWN\" or \"WAIT\", \"confidence\": \"80%\", \"reason\": \"max 6 words\"}";
+            String prompt = "You are an expert binary & forex scalping analyst. " + horizonText + " Analyze this live data for " + symbol + ":\n" +
+                    "Twelve Data Close: " + latestPrice + " | Finnhub Tick: " + latestFinnhubTick + " (Ref Price: " + effectivePriceRef + ")\n" +
+                    "RSI(14): " + String.format("%.2f", latestRsi) + "\n" +
+                    "EMA(9): " + String.format("%.5f", latestEma9) + " | EMA(21): " + String.format("%.5f", latestEma21) + "\n" +
+                    "Last 8 Candles (oldest to newest): " + latestCandlesSummary + "\n\n" +
+                    "Rules:\n" +
+                    "- Strong bullish setup -> UP\n" +
+                    "- Strong bearish setup -> DOWN\n" +
+                    "- Choppy/flat/unclear -> WAIT\n" +
+                    "Reply strictly in JSON: {\"signal\": \"UP\" or \"DOWN\" or \"WAIT\", \"confidence\": \"80%\", \"reason\": \"max 5 words\"}";
 
-                String aiResultJson = callGeminiAPI(prompt);
-                JSONObject aiObj = extractJsonObject(aiResultJson);
+            List<Future<AiVoteResult>> futures = new ArrayList<>();
 
-                String signal = aiObj.optString("signal", "WAIT").toUpperCase().trim();
-                if (!signal.equals("UP") && !signal.equals("DOWN") && !signal.equals("WAIT")) {
-                    signal = computeTechnicalFallbackSignal();
+            futures.add(aiExecutor.submit(() -> {
+                String raw = callGroqAPI(prompt);
+                JSONObject obj = extractJsonObject(raw);
+                String sig = normalizeSignal(obj.optString("signal", "WAIT"));
+                return new AiVoteResult("Groq", sig, obj.optString("confidence", ""), obj.optString("reason", "Groq"));
+            }));
+
+            futures.add(aiExecutor.submit(() -> {
+                String raw = callCloudflareAI(prompt);
+                JSONObject obj = extractJsonObject(raw);
+                String sig = normalizeSignal(obj.optString("signal", "WAIT"));
+                return new AiVoteResult("CF", sig, obj.optString("confidence", ""), obj.optString("reason", "CF"));
+            }));
+
+            futures.add(aiExecutor.submit(() -> {
+                String raw = callGeminiAPI(prompt);
+                JSONObject obj = extractJsonObject(raw);
+                String sig = normalizeSignal(obj.optString("signal", "WAIT"));
+                return new AiVoteResult("Gem", sig, obj.optString("confidence", ""), obj.optString("reason", "Gem"));
+            }));
+
+            int upVotes = 0;
+            int downVotes = 0;
+            int waitVotes = 0;
+            List<String> voteTags = new ArrayList<>();
+            String chosenReason = "";
+            String chosenConf = "";
+
+            for (Future<AiVoteResult> f : futures) {
+                try {
+                    AiVoteResult res = f.get(7500, TimeUnit.MILLISECONDS);
+                    if (res != null) {
+                        voteTags.add(res.provider + ":" + res.signal);
+                        if ("UP".equals(res.signal)) {
+                            upVotes++;
+                            if (chosenReason.isEmpty()) {
+                                chosenReason = res.reason;
+                                chosenConf = res.confidence;
+                            }
+                        } else if ("DOWN".equals(res.signal)) {
+                            downVotes++;
+                            if (chosenReason.isEmpty()) {
+                                chosenReason = res.reason;
+                                chosenConf = res.confidence;
+                            }
+                        } else {
+                            waitVotes++;
+                            if (chosenReason.isEmpty()) {
+                                chosenReason = res.reason;
+                                chosenConf = res.confidence;
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {
                 }
+            }
 
-                String confidence = aiObj.optString("confidence", "");
-                String reason = aiObj.optString("reason", "AI analysis");
-
-                applyLockedSignal(signal, confidence, reason + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " [" + lastUsedKeyLabel + "]", cycleNumber, fifteenMinMode);
-
-            } catch (Exception e) {
+            int totalVotes = upVotes + downVotes + waitVotes;
+            if (totalVotes == 0) {
                 String fallbackSignal = computeTechnicalFallbackSignal();
-                String shortErr = e.getMessage() != null ? e.getMessage() : "AI err";
-                if (shortErr.length() > 28) shortErr = shortErr.substring(0, 28);
                 applyLockedSignal(
                         fallbackSignal,
                         "TECH",
-                        "AI:" + shortErr + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick,
+                        "All AI busy | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick,
                         cycleNumber,
                         fifteenMinMode
                 );
+                return;
             }
+
+            String finalSignal;
+            if (upVotes > downVotes && upVotes >= waitVotes) {
+                finalSignal = "UP";
+            } else if (downVotes > upVotes && downVotes >= waitVotes) {
+                finalSignal = "DOWN";
+            } else if (waitVotes > upVotes && waitVotes > downVotes) {
+                finalSignal = "WAIT";
+            } else {
+                finalSignal = computeTechnicalFallbackSignal();
+            }
+
+            String votesSummary = String.join(",", voteTags);
+            if (chosenReason.isEmpty()) chosenReason = "Multi-AI consensus";
+            applyLockedSignal(
+                    finalSignal,
+                    chosenConf,
+                    chosenReason + " [" + votesSummary + "] RSI:" + (int) latestRsi,
+                    cycleNumber,
+                    fifteenMinMode
+            );
         });
+    }
+
+    private String normalizeSignal(String rawSignal) {
+        if (rawSignal == null) return "WAIT";
+        String s = rawSignal.toUpperCase().trim();
+        if (s.contains("UP") && !s.contains("DOWN")) return "UP";
+        if (s.contains("DOWN")) return "DOWN";
+        if (s.equals("UP") || s.equals("DOWN") || s.equals("WAIT")) return s;
+        return "WAIT";
     }
 
     private String computeTechnicalFallbackSignal() {
@@ -515,10 +620,10 @@ public class FloatingWidgetService extends Service {
                 long secIn15m = eSec % 900L;
                 int minPart = (int) (secIn15m / 60L);
                 int secPart = (int) (secIn15m % 60L);
-                if (currentCycle == targetCycleNumber && minPart == SIGNAL_MINUTE_15M && secPart <= SIGNAL_END_SECOND_IN_14M) {
+                if (currentCycle == targetCycleNumber && isIn15mSignalWindow(minPart, secPart)) {
                     tvSignalResult.setText(lockedSignalText);
                     tvSignalResult.setTextColor(lockedSignalColor);
-                    tvReason.setText("[15M " + minPart + "m" + secPart + "s / 14m] " + lockedReasonText);
+                    tvReason.setText("[15M " + minPart + "m" + secPart + "s / 14m40-50s] " + lockedReasonText);
                 }
             }
         });
@@ -647,6 +752,102 @@ public class FloatingWidgetService extends Service {
         return content.toString();
     }
 
+    private String callGroqAPI(String promptText) throws Exception {
+        String key = GROQ_API_KEY.trim();
+        if (key.isEmpty()) throw new Exception("No Groq key");
+
+        URL url = new URL("https://api.groq.com/openai/v1/chat/completions");
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("Authorization", "Bearer " + key);
+        conn.setConnectTimeout(6500);
+        conn.setReadTimeout(6500);
+        conn.setDoOutput(true);
+
+        JSONObject sysMsg = new JSONObject()
+                .put("role", "system")
+                .put("content", "Reply strictly in JSON: {\"signal\":\"UP|DOWN|WAIT\",\"confidence\":\"80%\",\"reason\":\"max 5 words\"}");
+        JSONObject userMsg = new JSONObject()
+                .put("role", "user")
+                .put("content", promptText);
+
+        JSONObject payload = new JSONObject()
+                .put("model", GROQ_MODEL)
+                .put("temperature", 0.2)
+                .put("messages", new JSONArray().put(sysMsg).put(userMsg));
+
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(payload.toString().getBytes("UTF-8"));
+        }
+
+        int code = conn.getResponseCode();
+        InputStream stream = (code >= 400) ? conn.getErrorStream() : conn.getInputStream();
+        BufferedReader in = new BufferedReader(new InputStreamReader(stream));
+        StringBuilder response = new StringBuilder();
+        String line;
+        while ((line = in.readLine()) != null) response.append(line);
+        in.close();
+        conn.disconnect();
+
+        if (code >= 400) throw new Exception("Groq HTTP " + code);
+
+        JSONObject jsonResponse = new JSONObject(response.toString());
+        return jsonResponse.getJSONArray("choices")
+                .getJSONObject(0)
+                .getJSONObject("message")
+                .getString("content");
+    }
+
+    private String callCloudflareAI(String promptText) throws Exception {
+        String accId = CF_ACCOUNT_ID.trim();
+        String token = CF_API_TOKEN.trim();
+        if (accId.isEmpty() || token.isEmpty()) throw new Exception("No CF credentials");
+
+        String endpoint = "https://api.cloudflare.com/client/v4/accounts/"
+                + accId + "/ai/run/" + CF_MODEL;
+        URL url = new URL(endpoint);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("Authorization", "Bearer " + token);
+        conn.setConnectTimeout(7000);
+        conn.setReadTimeout(7000);
+        conn.setDoOutput(true);
+
+        JSONObject sysMsg = new JSONObject()
+                .put("role", "system")
+                .put("content", "Reply strictly in JSON: {\"signal\":\"UP|DOWN|WAIT\",\"confidence\":\"80%\",\"reason\":\"max 5 words\"}");
+        JSONObject userMsg = new JSONObject()
+                .put("role", "user")
+                .put("content", promptText);
+
+        JSONObject payload = new JSONObject()
+                .put("messages", new JSONArray().put(sysMsg).put(userMsg));
+
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(payload.toString().getBytes("UTF-8"));
+        }
+
+        int code = conn.getResponseCode();
+        InputStream stream = (code >= 400) ? conn.getErrorStream() : conn.getInputStream();
+        BufferedReader in = new BufferedReader(new InputStreamReader(stream));
+        StringBuilder response = new StringBuilder();
+        String line;
+        while ((line = in.readLine()) != null) response.append(line);
+        in.close();
+        conn.disconnect();
+
+        if (code >= 400) throw new Exception("CF HTTP " + code);
+
+        JSONObject jsonResponse = new JSONObject(response.toString());
+        JSONObject resultObj = jsonResponse.optJSONObject("result");
+        if (resultObj != null && resultObj.has("response")) {
+            return resultObj.getString("response");
+        }
+        return response.toString();
+    }
+
     private String callGeminiAPI(String promptText) throws Exception {
         String stdKey = GEMINI_STANDARD_KEY.trim();
         String authKey = GEMINI_AUTH_KEY.trim();
@@ -738,7 +939,7 @@ public class FloatingWidgetService extends Service {
         }
         Notification notification = new NotificationCompat.Builder(this, channelId)
                 .setContentTitle("AI Trade Assistant Active")
-                .setContentText("1M (50-55s) & 15M (14m) nonstop scan active")
+                .setContentText("Multi-AI 1M (50-55s) & 15M (14m40-50s) active")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .build();
         startForeground(1, notification);
