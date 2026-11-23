@@ -15,9 +15,12 @@ import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.LinearLayout;
 import android.widget.Spinner;
 import android.widget.TextView;
 import androidx.core.app.NotificationCompat;
@@ -41,6 +44,7 @@ public class FloatingWidgetService extends Service {
     private WindowManager windowManager;
     private View floatingView;
     private Spinner spinnerCurrency;
+    private Spinner spinnerTimeframe;
     private Button btnAnalyze;
     private TextView tvSignalResult, tvReason;
 
@@ -71,17 +75,23 @@ public class FloatingWidgetService extends Service {
     private boolean usingBackupPool = false;
     private String lastUsedKeyLabel = "TD-Init";
 
-    // Gemini API Key
-    private static final String GEMINI_API_KEY = "AQ.Ab8RN6LeSxQQuI2grPNiubo5H-lS2mRvGpmVv26BtGSE5XngUQ";
+    // Gemini API Keys (AIzaSy Standard Key + AQ Auth Key)
+    private static final String GEMINI_STANDARD_KEY = "AIzaSyB4Ru9WugjRfL6Wir0Yo0_cIVfdeuIj_70";
+    private static final String GEMINI_AUTH_KEY = "AQ.Ab8RN6L6tVivJPnCVgj6sgW9QWgfbPau98h5SbpLmBDQUST_mA";
     private static final String GEMINI_MODEL = "gemini-2.5-flash";
 
-    // প্রতি ৬০ সেকেন্ডের সাইকেলে ৫০ থেকে ৫৫ সেকেন্ড পর্যন্ত UP / DOWN / WAIT নির্দেশনা দেবে
-    private static final int SIGNAL_START_SECOND = 50;
-    private static final int SIGNAL_END_SECOND = 55;
+    // 1M মোড: প্রতি ৬০ সেকেন্ডের সাইকেলে ৫০ থেকে ৫৫ সেকেন্ড পর্যন্ত সিগন্যাল
+    private static final int SIGNAL_START_SECOND_1M = 50;
+    private static final int SIGNAL_END_SECOND_1M = 55;
+
+    // 15M মোড: প্রতি ৯০০ সেকেন্ড (১৫ মিনিট) সাইকেলে ১৪তম মিনিটে (14m 0s - 14m 55s) সিগন্যাল
+    private static final int SIGNAL_MINUTE_15M = 14;
+    private static final int SIGNAL_END_SECOND_IN_14M = 55;
 
     // প্রতি ১.২৫ সেকেন্ড (১২৫০ms) পরপর ননস্টপ ডেটা কালেকশন (মিনিটে ৪৮ বার)
     private static final long COLLECTION_INTERVAL_MS = 1250;
 
+    private boolean is15MinuteMode = false;
     private boolean isAutoRunning = false;
     private boolean isScanInFlight = false;
     private boolean isAiInFlight = false;
@@ -112,41 +122,68 @@ public class FloatingWidgetService extends Service {
 
             long nowMs = System.currentTimeMillis();
             long elapsedSec = Math.max(0L, (nowMs - sessionStartTimeMs) / 1000L);
-            long cycleNumber = elapsedSec / 60L;
-            int cycleSec = (int) (elapsedSec % 60L);
-
             String selectedPair = spinnerCurrency.getSelectedItem().toString();
 
-            // ১. পুরো ৬০ সেকেন্ড ধরে ননস্টপ ডেটা কালেকশন
+            // ১. পুরো সাইকেল ধরে ননস্টপ ডেটা কালেকশন
             if (!isScanInFlight && (nowMs - lastCollectionTimeMs >= COLLECTION_INTERVAL_MS)) {
                 lastCollectionTimeMs = nowMs;
-                collectLiveDataNonstop(selectedPair);
+                collectLiveDataNonstop(selectedPair, is15MinuteMode ? "15min" : "1min");
             }
 
-            // ২. শুধুমাত্র ৫০ থেকে ৫৫ সেকেন্ডের উইন্ডোতে সিগন্যাল নির্দেশনা (UP / DOWN / WAIT)
-            if (cycleSec >= SIGNAL_START_SECOND && cycleSec <= SIGNAL_END_SECOND) {
-                if (cycleNumber != lastAiCycleNumber && !isAiInFlight && !latestCandlesSummary.isEmpty()) {
-                    lastAiCycleNumber = cycleNumber;
-                    triggerAiDecision(selectedPair, cycleSec, cycleNumber);
-                } else if (!isAiInFlight) {
-                    tvSignalResult.setText(lockedSignalText);
-                    tvSignalResult.setTextColor(lockedSignalColor);
-                    tvReason.setText("[" + cycleSec + "s / 50-55s] " + lockedReasonText);
-                }
-            } else if (!isAiInFlight) {
-                String liveBias = (latestEma9 > latestEma21) ? "LIVE: BULLISH"
-                        : (latestEma9 < latestEma21) ? "LIVE: BEARISH" : "SCANNING 48/m";
-                int biasColor = (latestEma9 > latestEma21) ? Color.parseColor("#34D399")
-                        : (latestEma9 < latestEma21) ? Color.parseColor("#F87171") : Color.CYAN;
+            if (!is15MinuteMode) {
+                // === ১ মিনিট (০–৬০ সেকেন্ড) মোড: ৫০ থেকে ৫৫ সেকেন্ডে সিগন্যাল ===
+                long cycleNumber = elapsedSec / 60L;
+                int cycleSec = (int) (elapsedSec % 60L);
 
-                tvSignalResult.setText(liveBias);
-                tvSignalResult.setTextColor(biasColor);
-                tvReason.setText("[" + cycleSec + "s] RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " | " + lastUsedKeyLabel);
+                if (cycleSec >= SIGNAL_START_SECOND_1M && cycleSec <= SIGNAL_END_SECOND_1M) {
+                    if (cycleNumber != lastAiCycleNumber && !isAiInFlight && !latestCandlesSummary.isEmpty()) {
+                        lastAiCycleNumber = cycleNumber;
+                        triggerAiDecision(selectedPair, cycleSec + "s / 50-55s", cycleNumber, false);
+                    } else if (!isAiInFlight) {
+                        tvSignalResult.setText(lockedSignalText);
+                        tvSignalResult.setTextColor(lockedSignalColor);
+                        tvReason.setText("[" + cycleSec + "s / 50-55s] " + lockedReasonText);
+                    }
+                } else if (!isAiInFlight) {
+                    updateLiveBiasUi("1M " + cycleSec + "s");
+                }
+            } else {
+                // === ১৫ মিনিট (০–১৫ মিনিট) মোড: ১৪তম মিনিটে সিগন্যাল ===
+                long cycleNumber = elapsedSec / 900L;
+                long secIn15m = elapsedSec % 900L;
+                int minPart = (int) (secIn15m / 60L);
+                int secPart = (int) (secIn15m % 60L);
+
+                boolean in14thMinWindow = (minPart == SIGNAL_MINUTE_15M && secPart <= SIGNAL_END_SECOND_IN_14M);
+
+                if (in14thMinWindow) {
+                    if (cycleNumber != lastAiCycleNumber && !isAiInFlight && !latestCandlesSummary.isEmpty()) {
+                        lastAiCycleNumber = cycleNumber;
+                        triggerAiDecision(selectedPair, minPart + "m" + secPart + "s / 14m", cycleNumber, true);
+                    } else if (!isAiInFlight) {
+                        tvSignalResult.setText(lockedSignalText);
+                        tvSignalResult.setTextColor(lockedSignalColor);
+                        tvReason.setText("[15M " + minPart + "m" + secPart + "s / 14m] " + lockedReasonText);
+                    }
+                } else if (!isAiInFlight) {
+                    updateLiveBiasUi("15M " + minPart + "m" + secPart + "s");
+                }
             }
 
             mainHandler.postDelayed(this, 200);
         }
     };
+
+    private void updateLiveBiasUi(String timerLabel) {
+        String liveBias = (latestEma9 > latestEma21) ? "LIVE: BULLISH"
+                : (latestEma9 < latestEma21) ? "LIVE: BEARISH" : "SCANNING 48/m";
+        int biasColor = (latestEma9 > latestEma21) ? Color.parseColor("#34D399")
+                : (latestEma9 < latestEma21) ? Color.parseColor("#F87171") : Color.CYAN;
+
+        tvSignalResult.setText(liveBias);
+        tvSignalResult.setTextColor(biasColor);
+        tvReason.setText("[" + timerLabel + "] RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " | " + lastUsedKeyLabel);
+    }
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -189,10 +226,14 @@ public class FloatingWidgetService extends Service {
         tvReason = floatingView.findViewById(R.id.tvReason);
         TextView btnClose = floatingView.findViewById(R.id.btnClose);
 
-        String[] pairs = {"EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "EUR/JPY", "BTC/USD", "ETH/USD"};
+        String[] pairs = {
+                "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "EUR/JPY",
+                "BTC/USD", "ETH/USD", "GRAM/USD", "LTC/USD", "BNB/USD"
+        };
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, pairs);
         spinnerCurrency.setAdapter(adapter);
 
+        setupTimeframeSpinner();
         resetSessionState();
 
         btnClose.setOnClickListener(v -> {
@@ -232,6 +273,49 @@ public class FloatingWidgetService extends Service {
         });
     }
 
+    private void setupTimeframeSpinner() {
+        int tfId = getResources().getIdentifier("spinnerTimeframe", "id", getPackageName());
+        View found = tfId != 0 ? floatingView.findViewById(tfId) : null;
+
+        if (found instanceof Spinner) {
+            spinnerTimeframe = (Spinner) found;
+        } else {
+            spinnerTimeframe = new Spinner(this);
+            ViewGroup parent = (spinnerCurrency != null && spinnerCurrency.getParent() instanceof ViewGroup)
+                    ? (ViewGroup) spinnerCurrency.getParent()
+                    : null;
+            if (parent != null) {
+                if (parent instanceof LinearLayout) {
+                    ((LinearLayout) parent).setOrientation(LinearLayout.VERTICAL);
+                }
+                parent.addView(spinnerTimeframe);
+            }
+        }
+
+        String[] modes = {"1M (0-60s -> 50-55s)", "15M (0-15m -> 14m)"};
+        ArrayAdapter<String> tfAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, modes);
+        spinnerTimeframe.setAdapter(tfAdapter);
+
+        spinnerTimeframe.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                boolean newModeIs15M = (position == 1);
+                if (newModeIs15M != is15MinuteMode) {
+                    is15MinuteMode = newModeIs15M;
+                    if (isAutoRunning) {
+                        startAutoLoop();
+                    } else {
+                        resetSessionState();
+                    }
+                }
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+    }
+
     private void resetSessionState() {
         long now = System.currentTimeMillis();
         sessionStartTimeMs = now;
@@ -253,7 +337,9 @@ public class FloatingWidgetService extends Service {
 
         lockedSignalText = "READY";
         lockedSignalColor = Color.WHITE;
-        lockedReasonText = "0s - Fresh scan started";
+        lockedReasonText = is15MinuteMode
+                ? "0s - 15M mode ready (signal at 14m)"
+                : "0s - 1M mode ready (signal at 50-55s)";
 
         if (tvSignalResult != null) {
             tvSignalResult.setText(lockedSignalText);
@@ -269,9 +355,11 @@ public class FloatingWidgetService extends Service {
         isAutoRunning = true;
         btnAnalyze.setText("STOP 48/m ENGINE");
         btnAnalyze.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.parseColor("#EF4444")));
-        tvSignalResult.setText("NONSTOP 48/m");
+        tvSignalResult.setText(is15MinuteMode ? "15M ENGINE" : "1M ENGINE");
         tvSignalResult.setTextColor(Color.CYAN);
-        tvReason.setText("[0s] Starting fresh scan...");
+        tvReason.setText(is15MinuteMode
+                ? "[15M 0m0s] Scanning for 14m signal..."
+                : "[1M 0s] Scanning for 50-55s signal...");
         mainHandler.removeCallbacks(nonstopEngineRunnable);
         mainHandler.post(nonstopEngineRunnable);
     }
@@ -285,14 +373,17 @@ public class FloatingWidgetService extends Service {
         tvReason.setText("Stopped & reset to 0s");
     }
 
-    private void collectLiveDataNonstop(String symbol) {
+    private void collectLiveDataNonstop(String symbol, String tdInterval) {
         isScanInFlight = true;
         scanExecutor.execute(() -> {
             try {
-                JSONObject json = fetchMarketDataSmartPool(symbol);
+                JSONObject json = fetchMarketDataSmartPool(symbol, tdInterval);
+                if ((json == null || json.optJSONArray("values") == null) && !"1min".equals(tdInterval)) {
+                    json = fetchMarketDataSmartPool(symbol, "1min");
+                }
                 String fhTick = fetchFinnhubLivePriceRotated(symbol);
 
-                JSONArray values = json.optJSONArray("values");
+                JSONArray values = json != null ? json.optJSONArray("values") : null;
                 if (values == null || values.length() == 0) {
                     throw new Exception("Empty candles");
                 }
@@ -328,12 +419,12 @@ public class FloatingWidgetService extends Service {
         });
     }
 
-    private void triggerAiDecision(String symbol, int triggerCycleSec, long cycleNumber) {
+    private void triggerAiDecision(String symbol, String windowLabel, long cycleNumber, boolean fifteenMinMode) {
         isAiInFlight = true;
         mainHandler.post(() -> {
             tvSignalResult.setText("ANALYZING...");
             tvSignalResult.setTextColor(Color.YELLOW);
-            tvReason.setText("[" + triggerCycleSec + "s / 50-55s] Combining TD + FH + AI...");
+            tvReason.setText("[" + windowLabel + "] Combining TD + FH + AI...");
         });
 
         aiExecutor.execute(() -> {
@@ -341,8 +432,12 @@ public class FloatingWidgetService extends Service {
                     ? latestFinnhubTick
                     : String.valueOf(latestPrice);
 
+            String horizonText = fifteenMinMode
+                    ? "We are in the 14th minute before the next 15-minute candle opens."
+                    : "We are in the 50s-55s decision window before the next 1-minute candle opens.";
+
             try {
-                String prompt = "You are an expert 1-minute binary & forex scalping analyst. We are in the 50s-55s decision window before the next 1-minute candle opens. Analyze this live data for " + symbol + ":\n" +
+                String prompt = "You are an expert binary & forex scalping analyst. " + horizonText + " Analyze this live data for " + symbol + ":\n" +
                         "Twelve Data Close: " + latestPrice + " | Finnhub Tick: " + latestFinnhubTick + " (Ref Price: " + effectivePriceRef + ")\n" +
                         "RSI(14): " + String.format("%.2f", latestRsi) + "\n" +
                         "EMA(9): " + String.format("%.5f", latestEma9) + " | EMA(21): " + String.format("%.5f", latestEma21) + "\n" +
@@ -364,7 +459,7 @@ public class FloatingWidgetService extends Service {
                 String confidence = aiObj.optString("confidence", "");
                 String reason = aiObj.optString("reason", "AI analysis");
 
-                applyLockedSignal(signal, confidence, reason + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " [" + lastUsedKeyLabel + "]", cycleNumber);
+                applyLockedSignal(signal, confidence, reason + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " [" + lastUsedKeyLabel + "]", cycleNumber, fifteenMinMode);
 
             } catch (Exception e) {
                 String fallbackSignal = computeTechnicalFallbackSignal();
@@ -374,7 +469,8 @@ public class FloatingWidgetService extends Service {
                         fallbackSignal,
                         "TECH",
                         "AI:" + shortErr + " | RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick,
-                        cycleNumber
+                        cycleNumber,
+                        fifteenMinMode
                 );
             }
         });
@@ -389,7 +485,7 @@ public class FloatingWidgetService extends Service {
         return "WAIT";
     }
 
-    private void applyLockedSignal(String signal, String confidence, String reasonDetail, long targetCycleNumber) {
+    private void applyLockedSignal(String signal, String confidence, String reasonDetail, long targetCycleNumber, boolean fifteenMinMode) {
         lockedSignalText = signal + (confidence.isEmpty() ? "" : " (" + confidence + ")");
         lockedReasonText = reasonDetail;
 
@@ -405,25 +501,38 @@ public class FloatingWidgetService extends Service {
             isAiInFlight = false;
             if (!isAutoRunning) return;
             long eSec = Math.max(0L, (System.currentTimeMillis() - sessionStartTimeMs) / 1000L);
-            long currentCycle = eSec / 60L;
-            int cSec = (int) (eSec % 60L);
-            if (currentCycle == targetCycleNumber && cSec >= SIGNAL_START_SECOND && cSec <= SIGNAL_END_SECOND) {
-                tvSignalResult.setText(lockedSignalText);
-                tvSignalResult.setTextColor(lockedSignalColor);
-                tvReason.setText("[" + cSec + "s / 50-55s] " + lockedReasonText);
+
+            if (!fifteenMinMode) {
+                long currentCycle = eSec / 60L;
+                int cSec = (int) (eSec % 60L);
+                if (currentCycle == targetCycleNumber && cSec >= SIGNAL_START_SECOND_1M && cSec <= SIGNAL_END_SECOND_1M) {
+                    tvSignalResult.setText(lockedSignalText);
+                    tvSignalResult.setTextColor(lockedSignalColor);
+                    tvReason.setText("[1M " + cSec + "s / 50-55s] " + lockedReasonText);
+                }
+            } else {
+                long currentCycle = eSec / 900L;
+                long secIn15m = eSec % 900L;
+                int minPart = (int) (secIn15m / 60L);
+                int secPart = (int) (secIn15m % 60L);
+                if (currentCycle == targetCycleNumber && minPart == SIGNAL_MINUTE_15M && secPart <= SIGNAL_END_SECOND_IN_14M) {
+                    tvSignalResult.setText(lockedSignalText);
+                    tvSignalResult.setTextColor(lockedSignalColor);
+                    tvReason.setText("[15M " + minPart + "m" + secPart + "s / 14m] " + lockedReasonText);
+                }
             }
         });
     }
 
-    private JSONObject fetchMarketDataSmartPool(String symbol) throws Exception {
+    private JSONObject fetchMarketDataSmartPool(String symbol, String interval) throws Exception {
         String[] activePool = usingBackupPool ? BACKUP_KEYS : PRIMARY_KEYS;
-        JSONObject result = tryPool(activePool, symbol, usingBackupPool ? "Set2" : "Set1");
+        JSONObject result = tryPool(activePool, symbol, interval, usingBackupPool ? "Set2" : "Set1");
         if (result != null) return result;
 
         if (!usingBackupPool) {
             usingBackupPool = true;
             roundRobinIndex = 0;
-            result = tryPool(BACKUP_KEYS, symbol, "Set2");
+            result = tryPool(BACKUP_KEYS, symbol, interval, "Set2");
             if (result != null) return result;
         }
 
@@ -431,7 +540,7 @@ public class FloatingWidgetService extends Service {
         throw new Exception("All Twelve Data keys busy");
     }
 
-    private JSONObject tryPool(String[] pool, String symbol, String poolName) throws Exception {
+    private JSONObject tryPool(String[] pool, String symbol, String interval, String poolName) throws Exception {
         int attempts = 0;
         while (attempts < pool.length) {
             int idx = roundRobinIndex % pool.length;
@@ -444,7 +553,7 @@ public class FloatingWidgetService extends Service {
             }
 
             String apiUrl = "https://api.twelvedata.com/time_series?symbol=" + symbol +
-                    "&interval=1min&outputsize=30&apikey=" + key.trim();
+                    "&interval=" + interval + "&outputsize=30&apikey=" + key.trim();
 
             String response = httpGet(apiUrl);
             JSONObject json = new JSONObject(response);
@@ -458,6 +567,11 @@ public class FloatingWidgetService extends Service {
         return null;
     }
 
+    private boolean isCryptoPair(String pair) {
+        return pair.contains("BTC") || pair.contains("ETH")
+                || pair.contains("GRAM") || pair.contains("LTC") || pair.contains("BNB");
+    }
+
     private String fetchFinnhubLivePriceRotated(String pair) {
         if (FINNHUB_KEYS.length == 0) return "N/A";
         for (int i = 0; i < FINNHUB_KEYS.length; i++) {
@@ -467,7 +581,7 @@ public class FloatingWidgetService extends Service {
             if (key == null || key.trim().isEmpty()) continue;
 
             String[] candidates;
-            if (pair.contains("BTC") || pair.contains("ETH")) {
+            if (isCryptoPair(pair)) {
                 String base = pair.replace("/", "");
                 candidates = new String[]{"BINANCE:" + base + "T", "BINANCE:" + base};
             } else {
@@ -534,7 +648,8 @@ public class FloatingWidgetService extends Service {
     }
 
     private String callGeminiAPI(String promptText) throws Exception {
-        String key = GEMINI_API_KEY.trim();
+        String stdKey = GEMINI_STANDARD_KEY.trim();
+        String authKey = GEMINI_AUTH_KEY.trim();
         String baseEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
                 + GEMINI_MODEL + ":generateContent";
 
@@ -545,17 +660,25 @@ public class FloatingWidgetService extends Service {
                 .put("contents", new JSONArray().put(parts))
                 .put("generationConfig", genConfig);
 
-        // ১. Bearer হেডার দিয়ে চেষ্টা
-        try {
-            return postGeminiRequest(baseEndpoint, payload.toString(), "Bearer " + key);
-        } catch (Exception bearerEx) {
-            String msg = bearerEx.getMessage() != null ? bearerEx.getMessage() : "";
-            if (!msg.contains("401") && !msg.contains("403")) {
-                throw bearerEx;
+        Exception lastEx = null;
+
+        if (!stdKey.isEmpty()) {
+            try {
+                return postGeminiRequest(baseEndpoint + "?key=" + stdKey, payload.toString(), null);
+            } catch (Exception ex) {
+                lastEx = ex;
             }
-            // ২. Bearer না কাজ করলে query ?key= দিয়ে ফলব্যাক চেষ্টা
-            return postGeminiRequest(baseEndpoint + "?key=" + key, payload.toString(), null);
         }
+
+        if (!authKey.isEmpty()) {
+            try {
+                return postGeminiRequest(baseEndpoint, payload.toString(), "Bearer " + authKey);
+            } catch (Exception ex) {
+                lastEx = ex;
+            }
+        }
+
+        throw lastEx != null ? lastEx : new Exception("No Gemini key");
     }
 
     private String postGeminiRequest(String endpointUrl, String jsonBody, String authHeader) throws Exception {
@@ -615,7 +738,7 @@ public class FloatingWidgetService extends Service {
         }
         Notification notification = new NotificationCompat.Builder(this, channelId)
                 .setContentTitle("AI Trade Assistant Active")
-                .setContentText("48/min nonstop data & 50-55s signal active")
+                .setContentText("1M (50-55s) & 15M (14m) nonstop scan active")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .build();
         startForeground(1, notification);
