@@ -7,10 +7,12 @@ import android.app.Service;
 import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
@@ -141,6 +143,11 @@ public class FloatingWidgetService extends Service {
         }
     }
 
+    private int dp(int value) {
+        return (int) TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP, value, getResources().getDisplayMetrics());
+    }
+
     private boolean isIn15mSignalWindow(int minPart, int secPart) {
         return minPart == SIGNAL_MINUTE_15M
                 && secPart >= SIGNAL_START_SECOND_IN_14M
@@ -154,7 +161,7 @@ public class FloatingWidgetService extends Service {
 
             long nowMs = System.currentTimeMillis();
             long elapsedSec = Math.max(0L, (nowMs - sessionStartTimeMs) / 1000L);
-            String selectedPair = spinnerCurrency.getSelectedItem().toString();
+            String selectedPair = getSelectedCurrencyPair();
 
             // ১. পুরো সাইকেল ধরে ননস্টপ ডেটা কালেকশন
             if (!isScanInFlight && (nowMs - lastCollectionTimeMs >= COLLECTION_INTERVAL_MS)) {
@@ -174,10 +181,10 @@ public class FloatingWidgetService extends Service {
                     } else if (!isAiInFlight) {
                         tvSignalResult.setText(lockedSignalText);
                         tvSignalResult.setTextColor(lockedSignalColor);
-                        tvReason.setText("[" + cycleSec + "s / 50-55s] " + lockedReasonText);
+                        tvReason.setText("[" + selectedPair + " | 1M " + cycleSec + "s] " + lockedReasonText);
                     }
                 } else if (!isAiInFlight) {
-                    updateLiveBiasUi("1M " + cycleSec + "s");
+                    updateLiveBiasUi(selectedPair, "1M " + cycleSec + "s");
                 }
             } else {
                 // === ১৫ মিনিট (০–১৫ মিনিট) মোড: ১৪ মিনিট ৪০ থেকে ৫০ সেকেন্ডে সিগন্যাল ===
@@ -193,10 +200,10 @@ public class FloatingWidgetService extends Service {
                     } else if (!isAiInFlight) {
                         tvSignalResult.setText(lockedSignalText);
                         tvSignalResult.setTextColor(lockedSignalColor);
-                        tvReason.setText("[15M " + minPart + "m" + secPart + "s / 14m40-50s] " + lockedReasonText);
+                        tvReason.setText("[" + selectedPair + " | 15M " + minPart + "m" + secPart + "s] " + lockedReasonText);
                     }
                 } else if (!isAiInFlight) {
-                    updateLiveBiasUi("15M " + minPart + "m" + secPart + "s");
+                    updateLiveBiasUi(selectedPair, "15M " + minPart + "m" + secPart + "s");
                 }
             }
 
@@ -204,7 +211,14 @@ public class FloatingWidgetService extends Service {
         }
     };
 
-    private void updateLiveBiasUi(String timerLabel) {
+    private String getSelectedCurrencyPair() {
+        if (spinnerCurrency != null && spinnerCurrency.getSelectedItem() != null) {
+            return spinnerCurrency.getSelectedItem().toString();
+        }
+        return "EUR/USD";
+    }
+
+    private void updateLiveBiasUi(String pair, String timerLabel) {
         String liveBias = (latestEma9 > latestEma21) ? "LIVE: BULLISH"
                 : (latestEma9 < latestEma21) ? "LIVE: BEARISH" : "SCANNING 48/m";
         int biasColor = (latestEma9 > latestEma21) ? Color.parseColor("#34D399")
@@ -212,7 +226,7 @@ public class FloatingWidgetService extends Service {
 
         tvSignalResult.setText(liveBias);
         tvSignalResult.setTextColor(biasColor);
-        tvReason.setText("[" + timerLabel + "] RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick + " | " + lastUsedKeyLabel);
+        tvReason.setText("[" + pair + " | " + timerLabel + "] RSI:" + (int) latestRsi + " | FH:" + latestFinnhubTick);
     }
 
     @Override
@@ -237,33 +251,30 @@ public class FloatingWidgetService extends Service {
                 : WindowManager.LayoutParams.TYPE_PHONE;
 
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
+                dp(292),
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 layoutFlag,
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT);
 
         params.gravity = Gravity.TOP | Gravity.START;
-        params.x = 50;
-        params.y = 200;
+        params.x = dp(16);
+        params.y = dp(120);
 
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         windowManager.addView(floatingView, params);
 
-        spinnerCurrency = floatingView.findViewById(R.id.spinnerCurrency);
         btnAnalyze = floatingView.findViewById(R.id.btnAnalyze);
         tvSignalResult = floatingView.findViewById(R.id.tvSignalResult);
         tvReason = floatingView.findViewById(R.id.tvReason);
         TextView btnClose = floatingView.findViewById(R.id.btnClose);
 
-        String[] pairs = {
-                "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "EUR/JPY",
-                "BTC/USD", "ETH/USD", "GRAM/USD", "LTC/USD", "BNB/USD"
-        };
-        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, pairs);
-        spinnerCurrency.setAdapter(adapter);
+        View existingSpinnerView = floatingView.findViewById(R.id.spinnerCurrency);
+        if (existingSpinnerView instanceof Spinner) {
+            spinnerCurrency = (Spinner) existingSpinnerView;
+        }
 
-        setupTimeframeSpinner();
+        setupClearControlsLayout();
         resetSessionState();
 
         btnClose.setOnClickListener(v -> {
@@ -271,7 +282,10 @@ public class FloatingWidgetService extends Service {
             stopSelf();
         });
 
-        floatingView.findViewById(R.id.root_container).setOnTouchListener(new View.OnTouchListener() {
+        View dragTarget = floatingView.findViewById(R.id.root_container);
+        if (dragTarget == null) dragTarget = floatingView;
+
+        dragTarget.setOnTouchListener(new View.OnTouchListener() {
             private int initialX, initialY;
             private float initialTouchX, initialTouchY;
 
@@ -303,28 +317,132 @@ public class FloatingWidgetService extends Service {
         });
     }
 
-    private void setupTimeframeSpinner() {
-        int tfId = getResources().getIdentifier("spinnerTimeframe", "id", getPackageName());
-        View found = tfId != 0 ? floatingView.findViewById(tfId) : null;
+    private ArrayAdapter<String> createDarkSpinnerAdapter(String[] items) {
+        return new ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, items) {
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                TextView tv = (TextView) super.getView(position, convertView, parent);
+                tv.setTextColor(Color.WHITE);
+                tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                tv.setTypeface(tv.getTypeface(), android.graphics.Typeface.BOLD);
+                tv.setSingleLine(true);
+                tv.setPadding(dp(8), dp(6), dp(8), dp(6));
+                return tv;
+            }
 
-        if (found instanceof Spinner) {
-            spinnerTimeframe = (Spinner) found;
-        } else {
-            spinnerTimeframe = new Spinner(this);
-            ViewGroup parent = (spinnerCurrency != null && spinnerCurrency.getParent() instanceof ViewGroup)
-                    ? (ViewGroup) spinnerCurrency.getParent()
-                    : null;
-            if (parent != null) {
-                if (parent instanceof LinearLayout) {
-                    ((LinearLayout) parent).setOrientation(LinearLayout.VERTICAL);
-                }
-                parent.addView(spinnerTimeframe);
+            @Override
+            public View getDropDownView(int position, View convertView, ViewGroup parent) {
+                TextView tv = (TextView) super.getDropDownView(position, convertView, parent);
+                tv.setBackgroundColor(Color.parseColor("#1E293B"));
+                tv.setTextColor(Color.WHITE);
+                tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+                tv.setPadding(dp(12), dp(10), dp(12), dp(10));
+                return tv;
+            }
+        };
+    }
+
+    private GradientDrawable createSpinnerBoxBg() {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setColor(Color.parseColor("#1E293B"));
+        gd.setCornerRadius(dp(8));
+        gd.setStroke(dp(1), Color.parseColor("#475569"));
+        return gd;
+    }
+
+    private LinearLayout createLabeledRow(String labelText, Spinner spinner) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        rowLp.setMargins(0, dp(4), 0, dp(4));
+        row.setLayoutParams(rowLp);
+
+        TextView label = new TextView(this);
+        label.setText(labelText);
+        label.setTextColor(Color.parseColor("#94A3B8"));
+        label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        label.setTypeface(label.getTypeface(), android.graphics.Typeface.BOLD);
+        LinearLayout.LayoutParams labelLp = new LinearLayout.LayoutParams(dp(58), LinearLayout.LayoutParams.WRAP_CONTENT);
+        row.addView(label, labelLp);
+
+        if (spinner.getParent() instanceof ViewGroup) {
+            ((ViewGroup) spinner.getParent()).removeView(spinner);
+        }
+        spinner.setBackground(createSpinnerBoxBg());
+        spinner.setPopupBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.parseColor("#1E293B")));
+        LinearLayout.LayoutParams spLp = new LinearLayout.LayoutParams(0, dp(38), 1f);
+        row.addView(spinner, spLp);
+
+        return row;
+    }
+
+    private void setupClearControlsLayout() {
+        String[] pairs = {
+                "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "EUR/JPY",
+                "BTC/USD", "ETH/USD", "GRAM/USD", "LTC/USD", "BNB/USD"
+        };
+        String[] modes = {
+                "1M (0-60s -> 50-55s)",
+                "15M (0-15m -> 14m40-50s)"
+        };
+
+        if (spinnerCurrency == null) {
+            spinnerCurrency = new Spinner(this);
+        }
+        spinnerCurrency.setAdapter(createDarkSpinnerAdapter(pairs));
+        spinnerCurrency.setSelection(0);
+
+        spinnerTimeframe = new Spinner(this);
+        spinnerTimeframe.setAdapter(createDarkSpinnerAdapter(modes));
+        spinnerTimeframe.setSelection(0);
+
+        int tfId = getResources().getIdentifier("spinnerTimeframe", "id", getPackageName());
+        if (tfId != 0) {
+            View oldTf = floatingView.findViewById(tfId);
+            if (oldTf != null && oldTf.getParent() instanceof ViewGroup) {
+                ((ViewGroup) oldTf.getParent()).removeView(oldTf);
             }
         }
 
-        String[] modes = {"1M (0-60s -> 50-55s)", "15M (0-15m -> 14m40-50s)"};
-        ArrayAdapter<String> tfAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, modes);
-        spinnerTimeframe.setAdapter(tfAdapter);
+        LinearLayout controlsBox = new LinearLayout(this);
+        controlsBox.setOrientation(LinearLayout.VERTICAL);
+        controlsBox.setPadding(dp(4), dp(4), dp(4), dp(6));
+        controlsBox.addView(createLabeledRow("PAIR", spinnerCurrency));
+        controlsBox.addView(createLabeledRow("TIMER", spinnerTimeframe));
+
+        ViewGroup targetContainer = null;
+        if (tvSignalResult != null && tvSignalResult.getParent() instanceof ViewGroup) {
+            targetContainer = (ViewGroup) tvSignalResult.getParent();
+        } else if (floatingView instanceof ViewGroup) {
+            targetContainer = (ViewGroup) floatingView;
+        }
+
+        if (targetContainer != null) {
+            int insertIndex = 0;
+            if (tvSignalResult != null) {
+                int idx = targetContainer.indexOfChild(tvSignalResult);
+                if (idx >= 0) insertIndex = idx;
+            }
+            targetContainer.addView(controlsBox, insertIndex);
+        }
+
+        spinnerCurrency.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (isAutoRunning) {
+                    startAutoLoop();
+                } else {
+                    resetSessionState();
+                }
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
 
         spinnerTimeframe.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
@@ -365,11 +483,12 @@ public class FloatingWidgetService extends Service {
         latestEma21 = 0.0;
         latestCandlesSummary = "";
 
+        String pair = getSelectedCurrencyPair();
         lockedSignalText = "READY";
         lockedSignalColor = Color.WHITE;
-        lockedReasonText = is15MinuteMode
-                ? "0s - 15M mode ready (signal at 14m40-50s)"
-                : "0s - 1M mode ready (signal at 50-55s)";
+        lockedReasonText = pair + " | " + (is15MinuteMode
+                ? "0s - 15M (signal at 14m40-50s)"
+                : "0s - 1M (signal at 50-55s)");
 
         if (tvSignalResult != null) {
             tvSignalResult.setText(lockedSignalText);
@@ -377,19 +496,21 @@ public class FloatingWidgetService extends Service {
         }
         if (tvReason != null) {
             tvReason.setText(lockedReasonText);
+            tvReason.setTextColor(Color.parseColor("#E2E8F0"));
         }
     }
 
     private void startAutoLoop() {
         resetSessionState();
         isAutoRunning = true;
+        String pair = getSelectedCurrencyPair();
         btnAnalyze.setText("STOP 48/m ENGINE");
         btnAnalyze.setBackgroundTintList(android.content.res.ColorStateList.valueOf(Color.parseColor("#EF4444")));
         tvSignalResult.setText(is15MinuteMode ? "15M ENGINE" : "1M ENGINE");
         tvSignalResult.setTextColor(Color.CYAN);
-        tvReason.setText(is15MinuteMode
-                ? "[15M 0m0s] Scanning for 14m40-50s signal..."
-                : "[1M 0s] Scanning for 50-55s signal...");
+        tvReason.setText("[" + pair + " | 0s] " + (is15MinuteMode
+                ? "Scanning for 14m40-50s..."
+                : "Scanning for 50-55s..."));
         mainHandler.removeCallbacks(nonstopEngineRunnable);
         mainHandler.post(nonstopEngineRunnable);
     }
@@ -454,7 +575,7 @@ public class FloatingWidgetService extends Service {
         mainHandler.post(() -> {
             tvSignalResult.setText("ANALYZING...");
             tvSignalResult.setTextColor(Color.YELLOW);
-            tvReason.setText("[" + windowLabel + "] Groq + CF + Gemini voting...");
+            tvReason.setText("[" + symbol + " | " + windowLabel + "] Groq + CF + Gem...");
         });
 
         aiExecutor.execute(() -> {
@@ -606,6 +727,7 @@ public class FloatingWidgetService extends Service {
             isAiInFlight = false;
             if (!isAutoRunning) return;
             long eSec = Math.max(0L, (System.currentTimeMillis() - sessionStartTimeMs) / 1000L);
+            String pair = getSelectedCurrencyPair();
 
             if (!fifteenMinMode) {
                 long currentCycle = eSec / 60L;
@@ -613,7 +735,7 @@ public class FloatingWidgetService extends Service {
                 if (currentCycle == targetCycleNumber && cSec >= SIGNAL_START_SECOND_1M && cSec <= SIGNAL_END_SECOND_1M) {
                     tvSignalResult.setText(lockedSignalText);
                     tvSignalResult.setTextColor(lockedSignalColor);
-                    tvReason.setText("[1M " + cSec + "s / 50-55s] " + lockedReasonText);
+                    tvReason.setText("[" + pair + " | 1M " + cSec + "s] " + lockedReasonText);
                 }
             } else {
                 long currentCycle = eSec / 900L;
@@ -623,7 +745,7 @@ public class FloatingWidgetService extends Service {
                 if (currentCycle == targetCycleNumber && isIn15mSignalWindow(minPart, secPart)) {
                     tvSignalResult.setText(lockedSignalText);
                     tvSignalResult.setTextColor(lockedSignalColor);
-                    tvReason.setText("[15M " + minPart + "m" + secPart + "s / 14m40-50s] " + lockedReasonText);
+                    tvReason.setText("[" + pair + " | 15M " + minPart + "m" + secPart + "s] " + lockedReasonText);
                 }
             }
         });
@@ -939,7 +1061,7 @@ public class FloatingWidgetService extends Service {
         }
         Notification notification = new NotificationCompat.Builder(this, channelId)
                 .setContentTitle("AI Trade Assistant Active")
-                .setContentText("Multi-AI 1M (50-55s) & 15M (14m40-50s) active")
+                .setContentText("PAIR & TIMER controls active")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .build();
         startForeground(1, notification);
